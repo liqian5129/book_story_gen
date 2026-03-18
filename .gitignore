@@ -1,0 +1,29 @@
+# Environment & secrets
+.env
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+*.egg-info/
+
+# Node.js
+node_modules/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Generated data (large files)
+data/stories/
+data/book-story-video/public/
+
+# Logs
+*.log
