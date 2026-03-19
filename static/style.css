@@ -256,6 +256,11 @@ header {
 
 /* produce steps */
 .produce-steps { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+.assets-cover-row { display: flex; gap: 12px; align-items: flex-start; }
+.assets-col { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.cover-col { flex-shrink: 0; width: 72px; display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.cover-thumb img { width: 72px; height: 128px; object-fit: cover; }
+.cover-thumb-placeholder { width: 72px; height: 128px; background: var(--gray-light); border-radius: 4px; border: 1px dashed var(--border); }
 .produce-step {
   display: flex;
   align-items: center;
@@ -485,25 +490,35 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .today-loading { font-size: 12px; color: var(--text-muted); }
 
 /* ── Book type tags ── */
-.book-type-trending {
+.book-type-trending, .book-type-classic, .book-type-douban, .book-type-award {
   display: inline-block;
   font-size: 9px;
   padding: 1px 5px;
   border-radius: 8px;
-  background: var(--orange-light);
-  color: var(--orange);
   font-weight: 600;
   flex-shrink: 0;
 }
+.book-type-trending {
+  background: var(--orange-light);
+  color: var(--orange);
+}
 .book-type-classic {
-  display: inline-block;
-  font-size: 9px;
-  padding: 1px 5px;
-  border-radius: 8px;
   background: var(--primary-light);
   color: var(--primary);
-  font-weight: 600;
-  flex-shrink: 0;
+}
+.book-type-douban {
+  background: #fce8e8;
+  color: #c0392b;
+}
+.book-type-award {
+  background: #fdf6e3;
+  color: #b8860b;
+}
+.book-researched-dot {
+  font-size: 9px;
+  color: #27ae60;
+  vertical-align: middle;
+  margin-left: 2px;
 }
 
 /* ── AI discover button ── */
@@ -514,3 +529,12 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   font-weight: 700;
 }
 .btn-ai:hover:not(:disabled) { background: var(--primary); color: #fff !important; border-color: var(--primary); }
+
+/* ── Pipeline (一键生成) button ── */
+.btn-pipeline {
+  background: linear-gradient(135deg, var(--blue), #7c4dff);
+  border-color: transparent;
+  color: #fff !important;
+  font-weight: 600;
+}
+.btn-pipeline:hover:not(:disabled) { filter: brightness(1.1); border-color: transparent; }

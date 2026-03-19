@@ -1,9 +1,10 @@
 import {
-  AbsoluteFill, Audio, Easing, Img, Series, interpolate, staticFile,
+  AbsoluteFill, Audio, Easing, Img, Sequence, Series, interpolate, staticFile,
   useCurrentFrame, useVideoConfig,
 } from "remotion";
-import { SCENES, AUDIO_FILE, SUBTITLES, BOOK_TITLE, TITLE_CARD_MS, INTRO_FRAMES } from "./content";
-import { BookIntro } from "./Intro";
+import { SCENES, AUDIO_FILE, SUBTITLES, BOOK_TITLE, TITLE_CARD_MS, INTRO_FRAMES, STORY_COVER } from "./content";
+import { FilmStrip } from "./FilmStrip";
+import { CoverTransition } from "./CoverTransition";
 
 // ── Ken Burns 镜头运动 ──────────────────────────────────────────
 type KBMove = { fromScale: number; toScale: number; fromX: number; toX: number; fromY: number; toY: number };
@@ -27,12 +28,12 @@ const Scene: React.FC<{ image: string; duration: number; index: number }> = ({ i
   const scale = kb.fromScale + (kb.toScale - kb.fromScale) * t;
   const tx    = kb.fromX    + (kb.toX    - kb.fromX)    * t;
   const ty    = kb.fromY    + (kb.toY    - kb.fromY)    * t;
-  const opacity = interpolate(
-    frame,
-    [0, FADE, Math.max(FADE + 1, duration - FADE), duration],
-    [0, 1, 1, 0],
-    { extrapolateLeft: "clamp", extrapolateRight: "clamp" }
-  );
+  // 第一场景不淡入（与片头转场直接衔接），其余场景正常淡入淡出
+  const opacity = index === 0
+    ? interpolate(frame, [0, Math.max(1, duration - FADE), duration], [1, 1, 0],
+        { extrapolateLeft: "clamp", extrapolateRight: "clamp" })
+    : interpolate(frame, [0, FADE, Math.max(FADE + 1, duration - FADE), duration], [0, 1, 1, 0],
+        { extrapolateLeft: "clamp", extrapolateRight: "clamp" });
   return (
     <AbsoluteFill style={{ backgroundColor: "#000", opacity }}>
       <AbsoluteFill style={{ overflow: "hidden" }}>
@@ -115,13 +116,19 @@ const TitleCard: React.FC = () => {
 };
 
 // ── 主合成 ────────────────────────────────────────────────────
+const AUDIO_DELAY_FRAMES = 18; // 0.6s 延迟开始
+
 export const BookStoryComposition: React.FC = () => (
   <AbsoluteFill>
-    <Audio src={staticFile(AUDIO_FILE)} />
+    <Sequence from={AUDIO_DELAY_FRAMES}>
+      <Audio src={staticFile(AUDIO_FILE)} />
+    </Sequence>
     <Series>
       {INTRO_FRAMES > 0 && (
         <Series.Sequence durationInFrames={INTRO_FRAMES}>
-          <BookIntro />
+          <FilmStrip />
+          <CoverTransition />
+          <Audio src={staticFile("reel.mp3")} volume={1.2} />
         </Series.Sequence>
       )}
       {SCENES.map((scene, i) => (

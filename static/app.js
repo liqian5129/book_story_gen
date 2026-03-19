@@ -126,23 +126,39 @@ async function loadBooks() {
       return;
     }
     el.innerHTML = books.map(b => {
-      const hasStory = b.quote_count > 0 || false; // use story indicator
-      const typeTag = b.book_type === "trending"
-        ? `<span class="book-type-trending">热门</span>`
-        : `<span class="book-type-classic">经典</span>`;
+      const wid = b.weread_id || "";
+      let sourceTag;
+      if (wid.startsWith("douban_")) {
+        sourceTag = `<span class="book-type-douban">豆瓣Top</span>`;
+      } else if (wid.startsWith("award_")) {
+        sourceTag = `<span class="book-type-award">获奖书</span>`;
+      } else if (b.book_type === "trending") {
+        sourceTag = `<span class="book-type-trending">微信热读</span>`;
+      } else {
+        sourceTag = `<span class="book-type-classic">经典</span>`;
+      }
+      const researchedDot = b.researched_count > 0
+        ? `<span class="book-researched-dot" title="已研究">✦</span>`
+        : "";
+      // 进行中时不显示按钮，其他状态（含无故事）都显示
+      const busyStatuses = ["researching","scripting","producing","done","published"];
+      const pipelineBtn = !busyStatuses.includes(b.latest_story_status)
+        ? `<button class="btn-sm btn-pipeline pipeline-btn" data-book-id="${b.id}" title="一键生成：研究→脚本→配音→封面→视频">⚡</button>`
+        : "";
       return `
       <div class="book-item ${_selectedBookId == b.id ? 'active' : ''}" data-id="${b.id}">
         ${b.cover ? `<img class="book-cover-sm" src="${esc(b.cover)}" onerror="this.style.display='none'">` : ""}
         <div class="book-item-info">
-          <div class="book-item-title">${esc(b.title)}</div>
+          <div class="book-item-title">${esc(b.title)} ${researchedDot}</div>
           <div class="book-item-sub">
-            ${typeTag}
+            ${sourceTag}
             <span>${esc(b.author || "")}</span>
           </div>
         </div>
         <div class="book-item-actions">
           <button class="btn-sm btn-ai discover-btn" data-id="${b.id}" data-title="${esc(b.title)}" title="AI自动发现故事">✦</button>
           <button class="btn-sm btn-primary create-btn" data-id="${b.id}" data-title="${esc(b.title)}" title="手动创建故事">+</button>
+          ${pipelineBtn}
         </div>
       </div>`;
     }).join("");
@@ -174,6 +190,29 @@ async function loadBooks() {
       btn.addEventListener("click", e => {
         e.stopPropagation();
         openAngleModal(btn.dataset.id, btn.dataset.title);
+      });
+    });
+
+    el.querySelectorAll(".pipeline-btn").forEach(btn => {
+      btn.addEventListener("click", async e => {
+        e.stopPropagation();
+        const bookId = btn.dataset.bookId;
+        btn.disabled = true; btn.textContent = "生成中…";
+        try {
+          await post(`/books/${bookId}/run-pipeline`, {});
+          toast("一键生成任务已启动，约3-8分钟完成");
+          // 轮询：刷新书单 + 故事列表直到完成
+          const poll = setInterval(async () => {
+            try {
+              loadBooks();
+              if (_selectedBookId == bookId) loadStories();
+            } catch (_) {}
+          }, 8000);
+          setTimeout(() => { clearInterval(poll); loadBooks(); }, 720000);
+        } catch (e) {
+          toast(e.message, true);
+          btn.disabled = false; btn.textContent = "⚡";
+        }
       });
     });
 
@@ -350,24 +389,36 @@ function renderStoryCard(s) {
 
   // 制作步骤
   if (["script_approved","producing","done","published"].includes(s.status)) {
+    const coverSrc = s.cover_path ? `/${s.cover_path}?t=${s.updated_at||s.id}` : "";
     content += `<div class="produce-steps">
-      <div class="produce-step ${assets.length ? 'done' : ''}">
-        <span class="step-icon">${assets.length ? "✓" : "○"}</span>
-        <span>素材 (${assets.length}张)</span>
-        <button class="btn-sm fetch-assets-btn" data-id="${s.id}" ${_busyOps[s.id]?.has("fetch") ? "disabled" : ""}>${_busyOps[s.id]?.has("fetch") ? "抓取中…" : "抓取"}</button>
-        <button class="btn-sm gen-cover-btn" data-id="${s.id}" ${_busyOps[s.id]?.has("cover") ? "disabled" : ""}>${_busyOps[s.id]?.has("cover") ? "生成中…" : "AI封面"}</button>
+      <div class="assets-cover-row">
+        <div class="assets-col">
+          <div class="produce-step ${assets.length ? 'done' : ''}">
+            <span class="step-icon">${assets.length ? "✓" : "○"}</span>
+            <span>素材 (${assets.length}张)</span>
+            <button class="btn-sm fetch-assets-btn" data-id="${s.id}" ${_busyOps[s.id]?.has("fetch") ? "disabled" : ""}>${_busyOps[s.id]?.has("fetch") ? "抓取中…" : "抓取"}</button>
+          </div>
+          ${assets.length ? `<div class="asset-thumbs">${assets.map(a => {
+            const localSrc = a.local ? `/${a.local}` : esc(a.url);
+            return `<div class="asset-thumb-wrap lb-trigger" data-url="${localSrc}" data-caption="${esc(a.caption || a.keyword || '')}">
+              <img src="${localSrc}" onerror="this.parentElement.style.display='none'">
+              <div class="asset-caption">${esc(a.caption || a.keyword || '')}</div>
+            </div>`;
+          }).join("")}</div>` : ""}
+        </div>
+        <div class="cover-col">
+          ${coverSrc ? `<div class="asset-thumb-wrap lb-trigger cover-thumb" data-url="${coverSrc}" data-caption="封面">
+            <img class="cover-preview-img" data-id="${s.id}" src="${coverSrc}" onerror="this.closest('.cover-thumb').style.display='none'">
+            <div class="asset-caption">封面</div>
+          </div>` : `<div class="cover-thumb-placeholder"></div>`}
+          <button class="btn-sm gen-cover-btn" data-id="${s.id}" ${_busyOps[s.id]?.has("cover") ? "disabled" : ""}>${_busyOps[s.id]?.has("cover") ? "生成中…" : "生成封面"}</button>
+        </div>
       </div>
-      ${assets.length ? `<div class="asset-thumbs">${assets.map(a => {
-        const localSrc = a.local ? `/${a.local}` : esc(a.url);
-        return `<div class="asset-thumb-wrap lb-trigger" data-url="${localSrc}" data-caption="${esc(a.caption || a.keyword || '')}">
-          <img src="${localSrc}" onerror="this.parentElement.style.display='none'">
-          <div class="asset-caption">${esc(a.caption || a.keyword || '')}</div>
-        </div>`;
-      }).join("")}</div>` : ""}
       <div class="produce-step ${hasAudio ? 'done' : ''}">
         <span class="step-icon">${hasAudio ? "✓" : "○"}</span>
         <span>配音</span>
         <button class="btn-sm gen-audio-btn" data-id="${s.id}" ${_busyOps[s.id]?.has("audio") ? "disabled" : ""}>${_busyOps[s.id]?.has("audio") ? "配音中…" : "生成配音"}</button>
+        <button class="btn-sm tts-settings-btn" title="TTS参数设置">⚙</button>
         ${hasAudio ? `<audio controls preload="none" style="width:100%;margin-top:4px;height:32px"><source src="/data/stories/${s.id}/audio.mp3?t=${s.updated_at||s.id}" type="audio/mpeg"></audio>` : ""}
       </div>
       <div class="produce-step ${hasVideo ? 'done' : ''}">
@@ -492,23 +543,35 @@ function attachStoryEvents(root = document) {
       btn.disabled = true; btn.textContent = "生成中…";
       try {
         await post(`/stories/${id}/generate-cover`, {});
-        toast("AI封面生成中，约30秒后刷新");
+        toast("封面生成中…");
         const poll = setInterval(async () => {
           try {
-            const r = await fetch(`/data/stories/${id}/cover_ai.jpg`, { method: "HEAD" });
-            if (r.ok) {
+            const story = (await get(`/stories/${id}`));
+            if (story?.cover_path) {
               clearInterval(poll);
               _busyOps[id]?.delete("cover");
-              btn.disabled = false; btn.textContent = "AI封面✓";
-              toast("AI封面已生成");
+              btn.disabled = false; btn.textContent = "生成封面✓";
+              toast("封面已生成");
+              // 刷新封面预览
+              const ts = Date.now();
+              const newSrc = `/${story.cover_path}?t=${ts}`;
+              const img = document.querySelector(`.cover-preview-img[data-id="${id}"]`);
+              if (img) {
+                img.src = newSrc;
+                const wrap = img.closest(".cover-thumb");
+                if (wrap) { wrap.dataset.url = newSrc; wrap.style.display = ""; }
+              } else {
+                // 重新渲染卡片以显示封面
+                patchStoryCard(story);
+              }
             }
           } catch (_) { clearInterval(poll); _busyOps[id]?.delete("cover"); }
-        }, 5000);
-        setTimeout(() => { clearInterval(poll); _busyOps[id]?.delete("cover"); }, 120000);
+        }, 3000);
+        setTimeout(() => { clearInterval(poll); _busyOps[id]?.delete("cover"); }, 30000);
       } catch (e) {
         toast(e.message, true);
         _busyOps[id]?.delete("cover");
-        btn.disabled = false; btn.textContent = "AI封面";
+        btn.disabled = false; btn.textContent = "生成封面";
       }
     });
   });
@@ -778,6 +841,71 @@ function closeLightbox() {
   document.getElementById("lightbox")?.classList.remove("lb-show");
 }
 document.addEventListener("keydown", e => { if (e.key === "Escape") closeLightbox(); });
+
+// ── TTS 设置弹窗 ──────────────────────────────────────────────────────────────
+document.addEventListener("click", e => {
+  if (e.target.closest(".tts-settings-btn")) openTtsSettings();
+});
+
+async function openTtsSettings() {
+  let box = document.getElementById("tts-settings-modal");
+  if (!box) {
+    box = document.createElement("div");
+    box.id = "tts-settings-modal";
+    box.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:999;display:flex;align-items:center;justify-content:center";
+    box.innerHTML = `
+      <div style="background:var(--card-bg,#1e2130);border-radius:14px;padding:28px 32px;min-width:320px;color:var(--text,#eee)">
+        <div style="font-size:15px;font-weight:600;margin-bottom:20px">TTS 配音参数</div>
+        ${ttsSlider("speed_ratio",  "语速",     0.5, 1.5, 0.01, "慢 ←→ 快")}
+        ${ttsSlider("pitch_ratio",  "音调",     0.8, 1.2, 0.01, "低沉 ←→ 高亮")}
+        ${ttsSlider("volume_ratio", "音量",     0.5, 2.0, 0.05, "")}
+        ${ttsSlider("silence_s",    "句间停顿", 0,   2.0, 0.1,  "秒")}
+        <div style="display:flex;gap:10px;margin-top:22px;justify-content:flex-end">
+          <button class="btn-sm" id="tts-cancel-btn">取消</button>
+          <button class="btn-sm btn-primary" id="tts-save-btn">保存</button>
+        </div>
+      </div>`;
+    document.body.appendChild(box);
+    box.addEventListener("click", e => { if (e.target === box) box.remove(); });
+    document.getElementById("tts-cancel-btn").addEventListener("click", () => box.remove());
+    document.getElementById("tts-save-btn").addEventListener("click", saveTtsSettings);
+    box.querySelectorAll("input[type=range]").forEach(r => {
+      r.addEventListener("input", () => {
+        document.getElementById("tts-val-" + r.name).textContent = r.value;
+      });
+    });
+  }
+  try {
+    const s = await get("/tts-settings");
+    ["speed_ratio","pitch_ratio","volume_ratio","silence_s"].forEach(k => {
+      const r = box.querySelector(`input[name="${k}"]`);
+      if (r) { r.value = s[k]; document.getElementById("tts-val-" + k).textContent = s[k]; }
+    });
+  } catch(_) {}
+  document.body.appendChild(box);
+}
+
+function ttsSlider(name, label, min, max, step, hint) {
+  return `<div style="margin-bottom:14px">
+    <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px">
+      <span>${label}${hint ? ` <span style="opacity:.5;font-size:11px">${hint}</span>` : ""}</span>
+      <span id="tts-val-${name}" style="font-weight:600;min-width:36px;text-align:right">—</span>
+    </div>
+    <input type="range" name="${name}" min="${min}" max="${max}" step="${step}"
+      style="width:100%;accent-color:var(--blue,#4a9eff)">
+  </div>`;
+}
+
+async function saveTtsSettings() {
+  const box = document.getElementById("tts-settings-modal");
+  const body = {};
+  box.querySelectorAll("input[type=range]").forEach(r => { body[r.name] = parseFloat(r.value); });
+  try {
+    await post("/tts-settings", body);
+    toast("TTS参数已保存");
+    box.remove();
+  } catch(e) { toast(e.message, true); }
+}
 
 // ── 初始化 ────────────────────────────────────────────────────────────────────
 loadTodayPanel();

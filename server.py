@@ -35,6 +35,12 @@ _env = load_env()
 def cfg(key: str, default: str = "") -> str:
     return _env.get(key) or os.environ.get(key) or default
 
+async def run_subprocess(cmd, **kwargs):
+    """在线程池中运行阻塞式 subprocess，避免阻塞 asyncio 事件循环。"""
+    loop = asyncio.get_event_loop()
+    import functools
+    return await loop.run_in_executor(None, functools.partial(subprocess.run, cmd, **kwargs))
+
 # ── 初始化 ──────────────────────────────────────────────────────────────────
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -125,6 +131,18 @@ def get_db():
     conn.row_factory = sqlite3.Row
     return conn
 
+def db_get_story(story_id: int):
+    """从 DB 查询 story + book 连接行，返回 Row 对象。"""
+    c = get_db()
+    row = c.execute(
+        "SELECT s.*, b.title as book_title, b.author as book_author, "
+        "b.cover as book_cover "
+        "FROM stories s JOIN books b ON s.book_id=b.id WHERE s.id=?",
+        (story_id,)
+    ).fetchone()
+    c.close()
+    return row
+
 def init_db():
     conn = get_db()
     conn.executescript("""
@@ -188,6 +206,7 @@ def migrate_db():
         ("stories", "daily_date", "TEXT"),
         ("stories", "error_msg", "TEXT"),
         ("stories", "updated_at", "INTEGER"),
+        ("stories", "cover_path", "TEXT"),
     ]
     for table, col, typedef in migrations:
         try:
@@ -288,51 +307,146 @@ def parse_json_response(text: str) -> dict:
     text = re.sub(r"```\s*", "", text)
     return json.loads(text.strip())
 
-# ── 即梦AI 封面生成 ──────────────────────────────────────────────────────────
-JIMENG_STYLE_PREFIX = (
-    "Cinematic book cover art, vertical 9:16 portrait format, "
-    "dramatic chiaroscuro lighting, rich deep colors, painterly texture, "
-    "highly detailed digital illustration, moody atmospheric scene, "
-)
-JIMENG_STYLE_SUFFIX = (
-    " --no text, no words, no letters, no logos, no human faces, "
-    "no book spine, no watermark"
-)
+# ── 封面生成（Pillow，基于 cover_ref.jpg）───────────────────────────────────
+COVER_REF_PATH = Path("cover_ref.jpg")
+COVER_TARGET_W, COVER_TARGET_H = 1080, 1920
+_CN_FONT_CANDIDATES = [
+    "/System/Library/Fonts/Songti.ttc",          # 宋体，有衬线，更典雅艺术
+    "/System/Library/Fonts/STHeiti Medium.ttc",
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/System/Library/Fonts/STHeiti Light.ttc",
+    "/Library/Fonts/Arial Unicode.ttf",
+]
 
-JIMENG_COVER_PROMPT = """根据以下书籍故事脚本，用英文描述一个适合作为视频封面的画面场景（纯场景内容，不要描述风格）。
-要求：
-- 具体的场景：地点、物体、氛围、光线、色调
-- 体现书籍核心主题或情感
-- 不提文字、书名、人脸、logo
-- 80字以内纯英文
+def _load_cn_font(size: int):
+    from PIL import ImageFont
+    for path in _CN_FONT_CANDIDATES:
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
 
-书名：《{title}》 作者：{author}
-故事角度：{angle}
-脚本摘要：{script_excerpt}
+def make_cover_image(title: str, author: str) -> bytes:
+    """用 cover_ref.jpg 裁剪成竖屏，印上书名和作者，返回 JPEG bytes。"""
+    from PIL import Image, ImageDraw
+    import io
 
-只输出英文场景描述，不要其他内容。"""
+    if not COVER_REF_PATH.exists():
+        raise FileNotFoundError("cover_ref.jpg 不存在，请放置在项目根目录")
 
-async def jimeng_generate_image(prompt: str) -> bytes:
-    """调用 Ark 平台即梦AI文生图，返回图片二进制"""
-    api_key = cfg("JIMENG_API_KEY")
-    model   = cfg("JIMENG_MODEL")
-    if not api_key or api_key.startswith("xxxxxxxx"):
-        raise HTTPException(400, "请先在 .env 配置 JIMENG_API_KEY")
-    if not model or model.startswith("ep-xxx"):
-        raise HTTPException(400, "请先在 .env 配置 JIMENG_MODEL")
-    full_prompt = JIMENG_STYLE_PREFIX + prompt + JIMENG_STYLE_SUFFIX
-    async with httpx.AsyncClient(timeout=120) as client:
-        r = await client.post(
-            "https://ark.cn-beijing.volces.com/api/v3/images/generations",
-            headers={"Authorization": f"Bearer {api_key}"},
-            json={"model": model, "prompt": full_prompt,
-                  "size": "1440x2560", "response_format": "b64_json", "n": 1},
-        )
-    if r.status_code != 200:
-        raise HTTPException(502, f"即梦AI返回错误 {r.status_code}: {r.text[:200]}")
-    data = r.json()
-    b64 = data["data"][0]["b64_json"]
-    return base64.b64decode(b64)
+    img = Image.open(COVER_REF_PATH).convert("RGB")
+    src_w, src_h = img.size
+
+    # 等比缩放：以高度为基准填满目标竖屏
+    scale = max(COVER_TARGET_W / src_w, COVER_TARGET_H / src_h)
+    new_w = int(src_w * scale)
+    new_h = int(src_h * scale)
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+
+    # 取最左边裁剪
+    left = 0
+    top  = (new_h - COVER_TARGET_H) // 2
+    img = img.crop((left, top, left + COVER_TARGET_W, top + COVER_TARGET_H))
+
+    # 轻微暗化遮罩：仅底部文字区域，保留原图色彩
+    mask = Image.new("L", (COVER_TARGET_W, COVER_TARGET_H), 0)
+    mask_draw = ImageDraw.Draw(mask)
+    fade_start = int(COVER_TARGET_H * 0.45)  # 从 45% 处开始
+    for y in range(fade_start, COVER_TARGET_H):
+        alpha = int(90 * ((y - fade_start) / (COVER_TARGET_H - fade_start)) ** 1.2)
+        mask_draw.line([(0, y), (COVER_TARGET_W, y)], fill=min(alpha, 90))
+    dark = Image.new("RGB", (COVER_TARGET_W, COVER_TARGET_H), (0, 0, 0))
+    img = Image.composite(dark, img, mask)
+
+    draw = ImageDraw.Draw(img)
+
+    # 根据书名长度自动选择字号
+    title_len = len(title)
+    title_size = 100 if title_len <= 6 else (86 if title_len <= 10 else 72)
+    title_font  = _load_cn_font(title_size)
+    author_font = _load_cn_font(40)
+    sep_font    = _load_cn_font(28)
+
+    cx = COVER_TARGET_W // 2
+    title_y = COVER_TARGET_H - 720  # 距底部约 720px，偏上
+
+    # 半透明底板（衬托书名）
+    panel_pad_x, panel_pad_y = 60, 28
+    # 粗略估算文字高度
+    title_h_est = title_size + 12
+    panel_top    = title_y - panel_pad_y
+    panel_bottom = title_y + title_h_est + panel_pad_y
+    panel_layer  = Image.new("RGBA", img.size + (None,) if False else (COVER_TARGET_W, COVER_TARGET_H), (0, 0, 0, 0))
+    pd = ImageDraw.Draw(panel_layer)
+    pd.rectangle(
+        [(panel_pad_x, panel_top), (COVER_TARGET_W - panel_pad_x, panel_bottom)],
+        fill=(0, 0, 0, 110)
+    )
+    img = img.convert("RGBA")
+    img = Image.alpha_composite(img, panel_layer)
+    img = img.convert("RGB")
+    draw = ImageDraw.Draw(img)
+
+    # 书名阴影 + 正文
+    display_title = f"《{title}》"
+    shadow_off = 3
+    draw.text((cx + shadow_off, title_y + shadow_off), display_title,
+              font=title_font, fill=(0, 0, 0, 160), anchor="mt")
+    draw.text((cx, title_y), display_title,
+              font=title_font, fill=(255, 245, 210), anchor="mt")
+
+    # 装饰横线
+    line_y = title_y + title_h_est + 22
+    line_half = 60
+    draw.line([(cx - line_half, line_y), (cx + line_half, line_y)],
+              fill=(200, 170, 100), width=1)
+
+    # 作者
+    if author:
+        draw.text((cx, line_y + 18), author,
+                  font=author_font, fill=(210, 185, 135), anchor="mt")
+
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=92)
+    return buf.getvalue()
+
+# ── TTS 设置 ──────────────────────────────────────────────────────────────────
+TTS_SETTINGS_PATH = DATA_DIR / "tts_settings.json"
+TTS_SETTINGS_DEFAULT = {
+    "speed_ratio": 1.08,   # 语速 0.8慢 ~ 1.3快
+    "pitch_ratio": 1.0,    # 音调 0.8低沉 ~ 1.2高亮
+    "volume_ratio": 1.0,   # 音量
+    "silence_s": 0.6,      # 首句后停顿（秒）
+}
+
+def load_tts_settings() -> dict:
+    try:
+        s = json.loads(TTS_SETTINGS_PATH.read_text())
+        return {**TTS_SETTINGS_DEFAULT, **s}
+    except Exception:
+        return dict(TTS_SETTINGS_DEFAULT)
+
+@app.get("/api/tts-settings")
+async def api_get_tts_settings():
+    return load_tts_settings()
+
+class TtsSettingsBody(BaseModel):
+    speed_ratio: float
+    pitch_ratio: float
+    volume_ratio: float
+    silence_s: float
+
+@app.post("/api/tts-settings")
+async def api_save_tts_settings(body: TtsSettingsBody):
+    s = {
+        "speed_ratio":  round(max(0.5, min(2.0, body.speed_ratio)), 2),
+        "pitch_ratio":  round(max(0.5, min(2.0, body.pitch_ratio)), 2),
+        "volume_ratio": round(max(0.1, min(3.0, body.volume_ratio)), 2),
+        "silence_s":    round(max(0.0, min(3.0, body.silence_s)), 2),
+    }
+    TTS_SETTINGS_PATH.write_text(json.dumps(s, ensure_ascii=False, indent=2))
+    return {"ok": True, "settings": s}
 
 # ── Kimi 金句打分 ─────────────────────────────────────────────────────────────
 SCORE_PROMPT = """你是一个短视频文案专家，专门为书籍金句类短视频账号筛选内容。
@@ -462,7 +576,12 @@ class DouyinUrlIn(BaseModel):
 @app.get("/api/books")
 def api_list_books(status: Optional[str] = None):
     conn = get_db()
-    sql = """SELECT b.*, (SELECT COUNT(*) FROM quotes q WHERE q.book_id=b.id) as quote_count
+    sql = """SELECT b.*,
+             (SELECT COUNT(*) FROM quotes q WHERE q.book_id=b.id) as quote_count,
+             (SELECT COUNT(*) FROM stories s WHERE s.book_id=b.id) as story_count,
+             (SELECT COUNT(*) FROM stories s WHERE s.book_id=b.id AND s.status NOT IN ('pending_research','failed')) as researched_count,
+             (SELECT id FROM stories s WHERE s.book_id=b.id ORDER BY s.created_at DESC LIMIT 1) as latest_story_id,
+             (SELECT status FROM stories s WHERE s.book_id=b.id ORDER BY s.created_at DESC LIMIT 1) as latest_story_status
              FROM books b WHERE 1=1"""
     params = []
     if status:
@@ -1077,39 +1196,7 @@ async def api_generate_script(story_id: int, background_tasks: BackgroundTasks):
     if row["status"] not in ("research_done", "script_draft", "script_approved", "producing", "done", "published"):
         raise HTTPException(400, f"当前状态 {row['status']} 无法生成脚本，需先完成研究")
 
-    async def do_generate():
-        print(f"[script] ▶ 开始 story={story_id} 《{row['title']}》角度={row['angle']}", flush=True)
-        c = get_db()
-        c.execute("UPDATE stories SET status='scripting' WHERE id=?", (story_id,))
-        c.commit(); c.close()
-
-        summary_raw = row["research_summary"] or "{}"
-        try:
-            summary = json.loads(summary_raw)
-        except Exception:
-            summary = {}
-        facts = summary.get("facts", [])
-        research_text = summary.get("summary", "") + "\n\n关键事实：\n" + "\n".join(f"- {f}" for f in facts)
-
-        prompt = SCRIPT_TEMPLATE.format(
-            title=row["title"], author=row["author"] or "未知",
-            angle=row["angle"],
-            angle_focus=SCRIPT_PROMPTS.get(row["angle"], row["angle"]),
-            research=research_text,
-        )
-        script = await kimi_chat(prompt, temperature=1)
-        script = add_script_intro(script, row["title"])
-
-        story_dir = STORIES_DIR / str(story_id)
-        story_dir.mkdir(exist_ok=True)
-        (story_dir / "script_draft.txt").write_text(script, encoding="utf-8")
-
-        c = get_db()
-        c.execute("UPDATE stories SET script=?, status='script_draft' WHERE id=?", (script, story_id))
-        c.commit(); c.close()
-        print(f"[script] story {story_id} done", flush=True)
-
-    background_tasks.add_task(do_generate)
+    background_tasks.add_task(_run_generate, story_id)
     return {"ok": True, "message": "脚本生成中，请稍后刷新"}
 
 # ── 脚本审核（强制断点）─────────────────────────────────────────────────────
@@ -1216,7 +1303,15 @@ async def wikimedia_search_images(query: str, limit: int = 6) -> list:
                     mime = info.get("mime", "")
                     thumb_url = info.get("thumburl") or info.get("url", "")
                     print(f"[wikimedia]   {page_title} mime={mime} thumb={thumb_url[:60]}", flush=True)
-                    if mime.startswith("image/") and not mime.endswith("/svg+xml"):
+                    # 过滤：只要真实照片/绘画；排除 svg、djvu（书页扫描）、pdf
+                    is_real_image = (
+                        mime.startswith("image/")
+                        and not mime.endswith("/svg+xml")
+                        and "djvu" not in mime
+                        and "pdf" not in mime
+                        and "vnd." not in mime  # 排除所有 vnd.* 格式
+                    )
+                    if is_real_image:
                         results.append({
                             "title": page_title, "url": thumb_url,
                             "mime": "image/jpeg",
@@ -1465,6 +1560,18 @@ async def api_fetch_assets(story_id: int, background_tasks: BackgroundTasks):
                         ir = await client.get(img["url"])
                     print(f"[assets]   {img['url'][-50:]} → {ir.status_code}", flush=True)
                     if ir.status_code == 200 and len(ir.content) > 5000:
+                        # 尺寸/比例检查：避免保存极窄/极矮的图（如图表、横幅）
+                        try:
+                            import io as _io
+                            from PIL import Image as _PILImg
+                            _dim = _PILImg.open(_io.BytesIO(ir.content)).size
+                            _w, _h = _dim
+                            _ratio = max(_w, _h) / max(min(_w, _h), 1)
+                            if _w < 300 or _h < 300 or _ratio > 3.5:
+                                print(f"[assets]   ✗ 跳过不适合视频的图 {_w}x{_h} ratio={_ratio:.1f}", flush=True)
+                                continue
+                        except Exception:
+                            pass
                         safe_name = re.sub(r'[^\w\u4e00-\u9fff]', '_', q)[:30]
                         local_name = f"{img_idx:02d}_{safe_name}.jpg"
                         (asset_dir / local_name).write_bytes(ir.content)
@@ -1489,7 +1596,7 @@ async def api_fetch_assets(story_id: int, background_tasks: BackgroundTasks):
         c.commit(); c.close()
         print(f"[assets] story {story_id}: {len(assets)} assets fetched", flush=True)
 
-    background_tasks.add_task(do_fetch)
+    background_tasks.add_task(_run_fetch, story_id)
     return {"ok": True, "message": "素材抓取中，请稍后刷新"}
 
 # ── 即梦AI 封面生成 ──────────────────────────────────────────────────────────
@@ -1511,39 +1618,26 @@ async def api_generate_cover(story_id: int, background_tasks: BackgroundTasks):
     async def do_cover():
         title  = row["book_title"] or ""
         author = row["book_author"] or ""
-        angle  = row["angle"] or ""
-        script = row["script"] or ""
-        script_excerpt = script[:300]
-
-        # 1. 用 Kimi 生成英文场景描述
-        kimi_prompt = JIMENG_COVER_PROMPT.format(
-            title=title, author=author, angle=angle, script_excerpt=script_excerpt
-        )
         try:
-            img_prompt = await kimi_chat(kimi_prompt, temperature=0.7)
-            img_prompt = img_prompt.strip()
-            print(f"[cover] kimi prompt: {img_prompt}", flush=True)
+            loop = asyncio.get_event_loop()
+            import functools
+            img_bytes = await loop.run_in_executor(
+                None, functools.partial(make_cover_image, title, author)
+            )
+            cover_dir = STORIES_DIR / str(story_id)
+            cover_dir.mkdir(parents=True, exist_ok=True)
+            safe_title = re.sub(r'[^\w\u4e00-\u9fff]', '_', title)[:30]
+            cover_path = cover_dir / f"{safe_title}_cover.jpg"
+            cover_path.write_bytes(img_bytes)
+            c = get_db()
+            c.execute("UPDATE stories SET cover_path=? WHERE id=?", (str(cover_path), story_id))
+            c.commit(); c.close()
+            print(f"[cover] story {story_id}: 封面已保存 ({len(img_bytes)//1024}kB) → {cover_path}", flush=True)
         except Exception as e:
-            print(f"[cover] kimi 失败: {e}", flush=True)
-            return
+            print(f"[cover] 生成失败: {e}", flush=True)
 
-        # 2. 调用即梦AI生成图片
-        try:
-            img_bytes = await jimeng_generate_image(img_prompt)
-            print(f"[cover] jimeng 返回图片 {len(img_bytes)//1024}kB", flush=True)
-        except Exception as e:
-            print(f"[cover] jimeng 失败: {e}", flush=True)
-            return
-
-        # 3. 独立保存图片（不插入素材列表，不影响视频合成）
-        cover_dir = STORIES_DIR / str(story_id)
-        cover_dir.mkdir(parents=True, exist_ok=True)
-        cover_path = cover_dir / "cover_ai.jpg"
-        cover_path.write_bytes(img_bytes)
-        print(f"[cover] story {story_id}: AI封面已保存至 {cover_path}", flush=True)
-
-    background_tasks.add_task(do_cover)
-    return {"ok": True, "message": "AI封面生成中，约30秒后刷新"}
+    background_tasks.add_task(_run_cover, story_id)
+    return {"ok": True, "message": "封面生成中，约3秒后刷新"}
 
 # ── 配音生成（Volcengine TTS）───────────────────────────────────────────────
 @app.post("/api/stories/{story_id}/generate-audio")
@@ -1580,13 +1674,23 @@ async def api_generate_audio(story_id: int, background_tasks: BackgroundTasks):
         clean_script = re.sub(r"【[^】]*】", "", script).strip()
 
         # 在第一句话（引导语）后插入 1 秒停顿：拆成两段分别合成再拼接
-        first_end = re.search(r'[。！？]', clean_script)
-        if first_end:
-            part1 = clean_script[:first_end.end()].strip()
-            part2 = clean_script[first_end.end():].strip()
+        # 在"今天讲的是"之后插入停顿，使书名有呼吸感
+        m_split = re.search(r'今天[要]?讲的是', clean_script)
+        if m_split:
+            part1 = clean_script[:m_split.end()].strip()
+            part2 = clean_script[m_split.end():].strip()
         else:
-            part1 = clean_script
-            part2 = ""
+            # 备选：第一个句子结束处
+            first_end = re.search(r'[。！？]', clean_script)
+            if first_end:
+                part1 = clean_script[:first_end.end()].strip()
+                part2 = clean_script[first_end.end():].strip()
+            else:
+                part1 = clean_script
+                part2 = ""
+
+        tts_cfg = load_tts_settings()
+        print(f"[tts] 设置: 语速={tts_cfg['speed_ratio']} 音调={tts_cfg['pitch_ratio']} 音量={tts_cfg['volume_ratio']} 停顿={tts_cfg['silence_s']}s", flush=True)
 
         async def tts_call(text: str) -> bytes:
             payload = {
@@ -1595,9 +1699,9 @@ async def api_generate_audio(story_id: int, background_tasks: BackgroundTasks):
                 "audio": {
                     "voice_type": voice_type,
                     "encoding": "mp3",
-                    "speed_ratio": 1.08,
-                    "volume_ratio": 1.0,
-                    "pitch_ratio": 1.0,
+                    "speed_ratio": tts_cfg["speed_ratio"],
+                    "volume_ratio": tts_cfg["volume_ratio"],
+                    "pitch_ratio":  tts_cfg["pitch_ratio"],
                 },
                 "request": {
                     "reqid": str(uuid.uuid4()),
@@ -1623,37 +1727,86 @@ async def api_generate_audio(story_id: int, background_tasks: BackgroundTasks):
             story_dir = STORIES_DIR / str(story_id)
             story_dir.mkdir(exist_ok=True)
 
+            # 进一步拆分 part2：书名 + 正文（在书名后再加一个停顿）
+            # 书名通常在 《》 内，找第一个 》的位置
+            part_title = ""
+            part_story = part2
+            if part2:
+                m_title = re.search(r'》', part2)
+                if m_title:
+                    part_title = part2[:m_title.end()].strip()
+                    part_story  = part2[m_title.end():].strip()
+                else:
+                    # 备选：第一个句末标点
+                    m_sent = re.search(r'[。！？]', part2)
+                    if m_sent:
+                        part_title = part2[:m_sent.end()].strip()
+                        part_story  = part2[m_sent.end():].strip()
+
             bytes1 = await tts_call(part1)
             (story_dir / "tts_part1.mp3").write_bytes(bytes1)
 
             if part2:
-                bytes2 = await tts_call(part2)
-                (story_dir / "tts_part2.mp3").write_bytes(bytes2)
-                # 用 ffmpeg 拼接：part1 + 1s静音 + part2
                 concat_list = story_dir / "tts_concat.txt"
-                silence = story_dir / "tts_silence.mp3"
-                # 生成 1 秒静音
-                subprocess.run(
-                    ["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
-                     "-t", "0.6", "-q:a", "9", "-acodec", "libmp3lame", str(silence)],
-                    capture_output=True, timeout=15
-                )
-                concat_list.write_text(
-                    f"file '{(story_dir / 'tts_part1.mp3').resolve()}'\n"
-                    f"file '{silence.resolve()}'\n"
-                    f"file '{(story_dir / 'tts_part2.mp3').resolve()}'\n",
-                    encoding="utf-8"
-                )
+                silence1 = story_dir / "tts_silence1.mp3"  # 今天讲的是 → 书名
+                silence2 = story_dir / "tts_silence2.mp3"  # 书名 → 正文
+
+                async def make_silence(path, duration: float):
+                    await run_subprocess(
+                        ["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
+                         "-t", str(duration), "-q:a", "9", "-acodec", "libmp3lame", str(path)],
+                        capture_output=True, timeout=15
+                    )
+
+                await make_silence(silence1, 0.3)  # 今天讲的是 → 书名
+
                 audio_path = story_dir / "audio.mp3"
-                subprocess.run(
-                    ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                     "-i", str(concat_list), "-c", "copy", str(audio_path)],
-                    capture_output=True, timeout=60
-                )
-                concat_list.unlink(missing_ok=True)
-                silence.unlink(missing_ok=True)
-                (story_dir / "tts_part1.mp3").unlink(missing_ok=True)
-                (story_dir / "tts_part2.mp3").unlink(missing_ok=True)
+
+                if part_title and part_story:
+                    # 三段：part1 + 0.3s + 书名 + 0.3s + 正文
+                    await make_silence(silence2, 0.3)
+                    bytes_title = await tts_call(part_title)
+                    bytes_story = await tts_call(part_story)
+                    (story_dir / "tts_title.mp3").write_bytes(bytes_title)
+                    (story_dir / "tts_story.mp3").write_bytes(bytes_story)
+                    concat_list.write_text(
+                        f"file '{(story_dir / 'tts_part1.mp3').resolve()}'\n"
+                        f"file '{silence1.resolve()}'\n"
+                        f"file '{(story_dir / 'tts_title.mp3').resolve()}'\n"
+                        f"file '{silence2.resolve()}'\n"
+                        f"file '{(story_dir / 'tts_story.mp3').resolve()}'\n",
+                        encoding="utf-8"
+                    )
+                    await run_subprocess(
+                        ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                         "-i", str(concat_list), "-c", "copy", str(audio_path)],
+                        capture_output=True, timeout=60
+                    )
+                    concat_list.unlink(missing_ok=True)
+                    silence1.unlink(missing_ok=True)
+                    silence2.unlink(missing_ok=True)
+                    (story_dir / "tts_part1.mp3").unlink(missing_ok=True)
+                    (story_dir / "tts_title.mp3").unlink(missing_ok=True)
+                    (story_dir / "tts_story.mp3").unlink(missing_ok=True)
+                else:
+                    # 无法拆书名，退化为两段：part1 + 0.3s + part2
+                    bytes2 = await tts_call(part2)
+                    (story_dir / "tts_part2.mp3").write_bytes(bytes2)
+                    concat_list.write_text(
+                        f"file '{(story_dir / 'tts_part1.mp3').resolve()}'\n"
+                        f"file '{silence1.resolve()}'\n"
+                        f"file '{(story_dir / 'tts_part2.mp3').resolve()}'\n",
+                        encoding="utf-8"
+                    )
+                    await run_subprocess(
+                        ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                         "-i", str(concat_list), "-c", "copy", str(audio_path)],
+                        capture_output=True, timeout=60
+                    )
+                    concat_list.unlink(missing_ok=True)
+                    silence1.unlink(missing_ok=True)
+                    (story_dir / "tts_part1.mp3").unlink(missing_ok=True)
+                    (story_dir / "tts_part2.mp3").unlink(missing_ok=True)
             else:
                 audio_path = story_dir / "audio.mp3"
                 (story_dir / "tts_part1.mp3").rename(audio_path)
@@ -1664,11 +1817,11 @@ async def api_generate_audio(story_id: int, background_tasks: BackgroundTasks):
                 (str(audio_path), int(datetime.now().timestamp()), story_id)
             )
             c.commit(); c.close()
-            print(f"[tts] story {story_id}: audio saved ({part1[:20]}… + 1s + {len(part2)}字)", flush=True)
+            print(f"[tts] story {story_id}: audio saved ({part1[:20]}… | 书名:{part_title[:10] if part_title else '-'} | 正文:{len(part_story)}字)", flush=True)
         except Exception as e:
             print(f"[tts] story {story_id} failed: {e}", flush=True)
 
-    background_tasks.add_task(do_tts)
+    background_tasks.add_task(_run_tts, story_id)
     return {"ok": True, "message": "TTS配音任务已启动"}
 
 # ── Remotion 项目模板文件 ──────────────────────────────────────────────────────
@@ -1823,11 +1976,12 @@ export const CaptionOverlay: React.FC<{ sceneId: string }> = ({ sceneId }) => {
 """
 
 REMOTION_COMPOSITION_TSX = """import {
-  AbsoluteFill, Audio, Easing, Img, Series, interpolate, staticFile,
+  AbsoluteFill, Audio, Easing, Img, Sequence, Series, interpolate, staticFile,
   useCurrentFrame, useVideoConfig,
 } from "remotion";
-import { SCENES, AUDIO_FILE, SUBTITLES, BOOK_TITLE, TITLE_CARD_MS, INTRO_FRAMES } from "./content";
-import { BookIntro } from "./Intro";
+import { SCENES, AUDIO_FILE, SUBTITLES, BOOK_TITLE, TITLE_CARD_MS, INTRO_FRAMES, STORY_COVER } from "./content";
+import { FilmStrip } from "./FilmStrip";
+import { CoverTransition } from "./CoverTransition";
 
 // ── Ken Burns 镜头运动 ──────────────────────────────────────────
 type KBMove = { fromScale: number; toScale: number; fromX: number; toX: number; fromY: number; toY: number };
@@ -1851,12 +2005,12 @@ const Scene: React.FC<{ image: string; duration: number; index: number }> = ({ i
   const scale = kb.fromScale + (kb.toScale - kb.fromScale) * t;
   const tx    = kb.fromX    + (kb.toX    - kb.fromX)    * t;
   const ty    = kb.fromY    + (kb.toY    - kb.fromY)    * t;
-  const opacity = interpolate(
-    frame,
-    [0, FADE, Math.max(FADE + 1, duration - FADE), duration],
-    [0, 1, 1, 0],
-    { extrapolateLeft: "clamp", extrapolateRight: "clamp" }
-  );
+  // 第一场景不淡入（与片头转场直接衔接），其余场景正常淡入淡出
+  const opacity = index === 0
+    ? interpolate(frame, [0, Math.max(1, duration - FADE), duration], [1, 1, 0],
+        { extrapolateLeft: "clamp", extrapolateRight: "clamp" })
+    : interpolate(frame, [0, FADE, Math.max(FADE + 1, duration - FADE), duration], [0, 1, 1, 0],
+        { extrapolateLeft: "clamp", extrapolateRight: "clamp" });
   return (
     <AbsoluteFill style={{ backgroundColor: "#000", opacity }}>
       <AbsoluteFill style={{ overflow: "hidden" }}>
@@ -1939,13 +2093,19 @@ const TitleCard: React.FC = () => {
 };
 
 // ── 主合成 ────────────────────────────────────────────────────
+const AUDIO_DELAY_FRAMES = 18; // 0.6s 延迟开始
+
 export const BookStoryComposition: React.FC = () => (
   <AbsoluteFill>
-    <Audio src={staticFile(AUDIO_FILE)} />
+    <Sequence from={AUDIO_DELAY_FRAMES}>
+      <Audio src={staticFile(AUDIO_FILE)} />
+    </Sequence>
     <Series>
       {INTRO_FRAMES > 0 && (
         <Series.Sequence durationInFrames={INTRO_FRAMES}>
-          <BookIntro />
+          <FilmStrip />
+          <CoverTransition />
+          <Audio src={staticFile("reel.mp3")} volume={1.2} />
         </Series.Sequence>
       )}
       {SCENES.map((scene, i) => (
@@ -2152,14 +2312,31 @@ async def api_render_video(story_id: int, background_tasks: BackgroundTasks):
         # 每次渲染前更新 Composition.tsx（确保使用最新效果）
         (REMOTION_DIR / "src" / "Composition.tsx").write_text(REMOTION_COMPOSITION_TSX, encoding="utf-8")
 
-        # 拷贝片头组件（piantou/src/Intro.tsx → 主工程 src/Intro.tsx）
+        # 拷贝片头组件到主工程 src/Intro.tsx
         import shutil as _shutil
-        intro_src = Path("piantou/src/Intro.tsx")
+        # 拷贝 FilmStrip.tsx，并将固定 FILM_DURATION 替换为动态 durationInFrames
+        intro_src = Path("intro_src/FilmStrip.tsx")
         if intro_src.exists():
-            _shutil.copy2(str(intro_src), str(REMOTION_DIR / "src" / "Intro.tsx"))
-            print(f"[render] 片头组件已拷贝", flush=True)
+            intro_code = intro_src.read_text(encoding="utf-8")
+            # 让动画时长跟随 Sequence 的实际帧数，实现与音频精准对齐
+            intro_code = intro_code.replace(
+                "const { width, height } = useVideoConfig();",
+                "const { width, height, durationInFrames } = useVideoConfig();"
+            )
+            intro_code = intro_code.replace(
+                "[0, FILM_DURATION]",
+                "[0, durationInFrames]"
+            )
+            (REMOTION_DIR / "src" / "FilmStrip.tsx").write_text(intro_code, encoding="utf-8")
+            # 拷贝片头图片资源到 Remotion public 目录
+            pub_dir = REMOTION_DIR / "public"
+            intro_pub = Path("intro_src/public")
+            if intro_pub.exists():
+                for img_file in intro_pub.iterdir():
+                    _shutil.copy2(str(img_file), str(pub_dir / img_file.name))
+            print(f"[render] 片头组件 FilmStrip.tsx 已拷贝，图片资源已同步", flush=True)
         else:
-            print(f"[render] 警告：找不到 piantou/src/Intro.tsx，片头将跳过", flush=True)
+            print(f"[render] 警告：找不到 intro_src/FilmStrip.tsx，片头将跳过", flush=True)
 
         # 检查 TTS 配置
         if not all([cfg("VOLC_APPID"), cfg("VOLC_TOKEN"), cfg("VOLC_VOICE_TYPE")]):
@@ -2233,7 +2410,7 @@ async def api_render_video(story_id: int, background_tasks: BackgroundTasks):
         shutil.copy2(str(audio_src), str(pub_audio))
 
         # ffprobe 获取总时长
-        probe = subprocess.run(
+        probe = await run_subprocess(
             ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(pub_audio)],
             capture_output=True, text=True,
         )
@@ -2260,9 +2437,10 @@ async def api_render_video(story_id: int, background_tasks: BackgroundTasks):
             intro_frames = int((intro_end_pos / total_script_chars) * audio_frames)
         else:
             intro_frames = 90  # 默认 3 秒
-        intro_frames = max(45, min(intro_frames, 150))  # 限制在 1.5s ~ 5s
+        intro_frames = max(60, min(intro_frames, 150))  # 限制在 2s ~ 5s（至少留够转场帧数）
+        intro_frames += 12  # +0.4s 让胶卷滚动更慢
         # 如果找不到片头文件，不插片头
-        if not (REMOTION_DIR / "src" / "Intro.tsx").exists():
+        if not (REMOTION_DIR / "src" / "FilmStrip.tsx").exists():
             intro_frames = 0
         print(f"[render] 片头帧数={intro_frames}（{intro_frames/FPS:.1f}s），内容图片从此后开始", flush=True)
 
@@ -2281,6 +2459,18 @@ async def api_render_video(story_id: int, background_tasks: BackgroundTasks):
             scene_images.append(f"images/scene-{i+1:02d}{img.suffix}")
         print(f"[render] 总时长={total_duration_s:.1f}s 总帧数={total_frames} 图片数={n_scenes}", flush=True)
 
+        # 复制 CoverTransition.tsx
+        cover_trans_src = Path("intro_src/CoverTransition.tsx")
+        if cover_trans_src.exists():
+            _shutil.copy2(str(cover_trans_src), str(REMOTION_DIR / "src" / "CoverTransition.tsx"))
+
+        # 找书封图片并复制到 public/story_cover.jpg
+        story_cover_file = ""
+        if img_files:
+            _shutil.copy2(str(img_files[0]), str(REMOTION_DIR / "public" / "story_cover.jpg"))
+            story_cover_file = "story_cover.jpg"
+            print(f"[render] 书封已复制: {img_files[0].name}", flush=True)
+
         # ── 字幕：句子再拆成 ≤18 字小段，字符比例分配时间 ────────────────────
         def to_subtitle_chunks(text: str, max_len: int = 18) -> list[str]:
             sentences = [s.strip() for s in re.split(r'(?<=[。！？])', text.strip()) if s.strip()]
@@ -2298,7 +2488,7 @@ async def api_render_video(story_id: int, background_tasks: BackgroundTasks):
                     sent = sent[split_at:]
                 if sent:
                     chunks.append(sent)
-            return chunks
+            return [c.rstrip('。！？，、；：…—') for c in chunks]
 
         total_ms = int(total_duration_s * 1000)
         sub_chunks = to_subtitle_chunks(script.strip())
@@ -2334,6 +2524,7 @@ async def api_render_video(story_id: int, background_tasks: BackgroundTasks):
             f'export const BOOK_TITLE = {json.dumps(title, ensure_ascii=False)};\n'
             f'export const TITLE_CARD_MS = {{ startMs: {title_card_start_ms}, endMs: {title_card_end_ms} }};\n'
             f'export const INTRO_FRAMES = {intro_frames};\n'
+            f'export const STORY_COVER = {json.dumps(story_cover_file)};\n'
         )
         (REMOTION_DIR / "src" / "content.ts").write_text(content_ts, encoding="utf-8")
         print(f"[render] content.ts 已生成，字幕{len(subtitles)}句", flush=True)
@@ -2347,14 +2538,14 @@ async def api_render_video(story_id: int, background_tasks: BackgroundTasks):
             str(output_path.resolve()),
         ]
         print(f"[render] 开始 Remotion 渲染…", flush=True)
-        result = subprocess.run(
+        result = await run_subprocess(
             render_cmd, cwd=str(REMOTION_DIR),
             capture_output=True, text=True, timeout=600
         )
         if result.returncode == 0 and output_path.exists():
             # 重新编码：修复色彩空间 + faststart，确保浏览器正常播放
             web_path = story_dir / "video_web.mp4"
-            fs = subprocess.run(
+            fs = await run_subprocess(
                 ["ffmpeg", "-y", "-i", str(output_path),
                  "-c:v", "libx264", "-crf", "23", "-preset", "fast",
                  "-pix_fmt", "yuv420p",
@@ -2390,8 +2581,899 @@ async def api_render_video(story_id: int, background_tasks: BackgroundTasks):
             except Exception:
                 pass
 
-    background_tasks.add_task(do_render_safe)
+    background_tasks.add_task(_run_render, story_id)
     return {"ok": True, "message": "视频合成任务已启动"}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 一键全流程：模块级后台任务函数（可被 pipeline 直接调用）
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _run_generate(story_id: int):
+    """生成脚本（模块级，供 pipeline 调用）。"""
+    row = db_get_story(story_id)
+    if not row:
+        print(f"[script] story {story_id} not found", flush=True)
+        return
+    print(f"[script] ▶ 开始 story={story_id} 《{row['book_title']}》角度={row['angle']}", flush=True)
+    c = get_db()
+    c.execute("UPDATE stories SET status='scripting' WHERE id=?", (story_id,))
+    c.commit(); c.close()
+
+    summary_raw = row["research_summary"] or "{}"
+    try:
+        summary = json.loads(summary_raw)
+    except Exception:
+        summary = {}
+    facts = summary.get("facts", [])
+    research_text = summary.get("summary", "") + "\n\n关键事实：\n" + "\n".join(f"- {f}" for f in facts)
+
+    prompt = SCRIPT_TEMPLATE.format(
+        title=row["book_title"], author=row["book_author"] or "未知",
+        angle=row["angle"],
+        angle_focus=SCRIPT_PROMPTS.get(row["angle"], row["angle"]),
+        research=research_text,
+    )
+    script = await kimi_chat(prompt, temperature=1)
+    script = add_script_intro(script, row["book_title"])
+
+    story_dir = STORIES_DIR / str(story_id)
+    story_dir.mkdir(exist_ok=True)
+    (story_dir / "script_draft.txt").write_text(script, encoding="utf-8")
+
+    c = get_db()
+    c.execute("UPDATE stories SET script=?, status='script_draft' WHERE id=?", (script, story_id))
+    c.commit(); c.close()
+    print(f"[script] story {story_id} done", flush=True)
+
+
+async def _run_fetch(story_id: int):
+    """抓取素材（模块级，供 pipeline 调用）。"""
+    row = db_get_story(story_id)
+    if not row:
+        print(f"[assets] story {story_id} not found", flush=True)
+        return
+    asset_dir = STORIES_DIR / str(story_id) / "assets"
+    c = get_db(); c.execute("UPDATE stories SET assets='[]' WHERE id=?", (story_id,)); c.commit(); c.close()
+    import shutil as _shutil
+    _shutil.rmtree(str(asset_dir), ignore_errors=True)
+    asset_dir.mkdir(parents=True, exist_ok=True)
+    assets = []
+    title = row["book_title"]
+    author = row["book_author"] or ""
+    script = row["script"] or ""
+    angle = row["angle"] or ""
+
+    DOUBAN_HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://book.douban.com/",
+    }
+    cover_url = row["book_cover"]
+    if not cover_url and title:
+        try:
+            async with httpx.AsyncClient(timeout=10, headers=DOUBAN_HEADERS) as client:
+                r = await client.get(
+                    "https://book.douban.com/j/subject_suggest",
+                    params={"q": title},
+                )
+            if r.status_code == 200:
+                items = r.json()
+                best = None
+                for item in items:
+                    if item.get("type") != "b":
+                        continue
+                    if item.get("title", "").startswith(title):
+                        best = item
+                        break
+                if not best and items:
+                    best = next((i for i in items if i.get("type") == "b"), None)
+                if best and best.get("pic"):
+                    cover_url = best["pic"].replace("/s/public/", "/l/public/")
+                    print(f"[assets] 豆瓣封面: {cover_url}", flush=True)
+        except Exception as e:
+            print(f"[assets] 豆瓣查询失败: {e}", flush=True)
+
+    if cover_url:
+        try:
+            async with httpx.AsyncClient(timeout=15, headers=DOUBAN_HEADERS,
+                                         follow_redirects=True) as client:
+                r = await client.get(cover_url)
+            cover_too_small = False
+            if r.status_code == 200 and len(r.content) > 2000:
+                try:
+                    import io
+                    from PIL import Image as PILImage
+                    img_check = PILImage.open(io.BytesIO(r.content))
+                    w, h = img_check.size
+                    if w < 400 or h < 400:
+                        print(f"[assets] 豆瓣封面过小 {w}x{h}，尝试更好来源", flush=True)
+                        cover_too_small = True
+                    else:
+                        print(f"[assets] 豆瓣封面尺寸 {w}x{h}，可用", flush=True)
+                except Exception:
+                    pass
+            if r.status_code == 200 and len(r.content) > 2000 and not cover_too_small:
+                cover_bytes = r.content
+                cover_final_url = cover_url
+            else:
+                cover_bytes = None
+                cover_final_url = cover_url
+        except Exception as e:
+            cover_bytes = None
+            cover_final_url = cover_url
+            print(f"[assets] 豆瓣封面下载失败: {e}", flush=True)
+
+        if not cover_bytes and title:
+            try:
+                async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+                    ol = await client.get(
+                        "https://openlibrary.org/search.json",
+                        params={"title": title, "author": author or "", "limit": 3},
+                    )
+                for doc in (ol.json() if ol.text.strip() else {}).get("docs", []):
+                    cid = doc.get("cover_i")
+                    if not cid:
+                        continue
+                    ol_url = f"https://covers.openlibrary.org/b/id/{cid}-L.jpg"
+                    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+                        ol_r = await client.get(ol_url)
+                    if ol_r.status_code == 200 and len(ol_r.content) > 10000:
+                        cover_bytes = ol_r.content
+                        cover_final_url = ol_url
+                        print(f"[assets] Open Library封面: {ol_url}", flush=True)
+                        break
+            except Exception as e:
+                print(f"[assets] Open Library封面失败: {e}", flush=True)
+
+        if not cover_bytes and title:
+            try:
+                def title_bigrams(t: str) -> list:
+                    t2 = re.sub(r'[\s·\-：:《》「」\'"]+', '', t)
+                    return [t2[i:i+2] for i in range(len(t2) - 1)] if len(t2) >= 2 else [t2]
+                kw_bigrams = title_bigrams(title)
+                author_kws = [w.lower() for w in author.split() if len(w) >= 3] if author else []
+                for brave_query in [
+                    f'"{title}" 封面',
+                    f'"{title}" book cover',
+                    f'{title} {author} book cover'.strip(),
+                ]:
+                    brave_results = await brave_search_images(brave_query, limit=6)
+                    for br in brave_results:
+                        br_combined = (br.get("title", "") + " " + br.get("url", "")).lower()
+                        matched = (
+                            any(bg in br_combined for bg in kw_bigrams)
+                            or any(ak in br_combined for ak in author_kws)
+                        )
+                        if not matched:
+                            print(f"[assets] Brave封面不相关，跳过: {br.get('title','')[:60]}", flush=True)
+                            continue
+                        try:
+                            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+                                br_r = await client.get(br["url"])
+                            if br_r.status_code == 200 and len(br_r.content) > 20000:
+                                import io
+                                from PIL import Image as PILImage
+                                img_check = PILImage.open(io.BytesIO(br_r.content))
+                                w, h = img_check.size
+                                if w >= 200 and h >= 200:
+                                    cover_bytes = br_r.content
+                                    cover_final_url = br["url"]
+                                    print(f"[assets] Brave封面: {br['url']} {w}x{h}", flush=True)
+                                    break
+                        except Exception:
+                            continue
+                    if cover_bytes:
+                        break
+            except Exception as e:
+                print(f"[assets] Brave封面失败: {e}", flush=True)
+
+        if cover_bytes:
+            cover_path = asset_dir / "00_cover.jpg"
+            cover_path.write_bytes(cover_bytes)
+            assets.append({"type": "cover", "url": cover_final_url,
+                           "local": f"data/stories/{story_id}/assets/00_cover.jpg",
+                           "caption": f"《{title}》封面",
+                           "keyword": "书封面"})
+            print(f"[assets] ✓ 封面已保存 ({len(cover_bytes)//1024}KB)", flush=True)
+        else:
+            print(f"[assets] 封面获取失败", flush=True)
+
+    if author:
+        for author_q in [f"{author} portrait", f"{author} photograph", author]:
+            imgs = await wikimedia_search_images(author_q, limit=3)
+            if imgs:
+                print(f"[assets] 作者图搜「{author_q}」→ {len(imgs)}张", flush=True)
+                img = imgs[0]
+                try:
+                    async with httpx.AsyncClient(timeout=30, headers=WIKIMEDIA_HEADERS,
+                                                 follow_redirects=True) as client:
+                        ir = await client.get(img["url"])
+                    if ir.status_code == 200 and len(ir.content) > 5000:
+                        safe = re.sub(r'[^\w\u4e00-\u9fff]', '_', author)[:20]
+                        local_name = f"01_author_{safe}.jpg"
+                        (asset_dir / local_name).write_bytes(ir.content)
+                        caption = img.get("title", "").replace("File:", "").split(".")[0] or f"{author}照片"
+                        assets.append({"type": "author", "url": img["url"],
+                                       "local": f"data/stories/{story_id}/assets/{local_name}",
+                                       "caption": caption, "keyword": f"{author}照片"})
+                        print(f"[assets] ✓ 作者图已保存 {local_name}", flush=True)
+                        break
+                except Exception as e:
+                    print(f"[assets] 作者图下载失败: {e}", flush=True)
+                await asyncio.sleep(2)
+
+    img_provider = cfg("IMAGE_SEARCH_PROVIDER", "wikimedia").lower()
+    search_queries = [author]
+    if script:
+        try:
+            if img_provider == "google":
+                kw_hint = "适合在 Google 图片搜索的关键词，可以是具体场景、年代、地点、人物，也可以是能体现故事氛围的意象词。"
+            else:
+                kw_hint = "适合在 Wikimedia Commons 搜索的历史档案图片关键词，聚焦脚本中提到的具体人物、地点、事件、时代背景。"
+            kw_prompt = f"""根据以下书籍故事脚本，提取3-5个{kw_hint}
+要求：英文或中文关键词，不要用书名本身，要用脚本里的具体内容。
+
+书名：《{title}》 作者：{author} 故事角度：{angle}
+脚本：{script[:800]}
+
+严格返回JSON：{{"keywords": ["关键词1", "关键词2", "关键词3"]}}"""
+            kw_text = await kimi_chat(kw_prompt)
+            kw_result = parse_json_response(kw_text)
+            kw_list = kw_result.get("keywords", [])
+            if kw_list:
+                search_queries = kw_list[:4]
+                print(f"[assets] Kimi搜图关键词({img_provider}): {search_queries}", flush=True)
+        except Exception as e:
+            print(f"[assets] 关键词提取失败，用默认: {e}", flush=True)
+
+    img_idx = 1
+    for q in search_queries:
+        if not q or img_idx > 5:
+            break
+        images = await search_images(q, limit=3)
+        print(f"[assets] [{img_provider}] 搜「{q}」→ {len(images)} 张", flush=True)
+        for img in images[:2]:
+            if img_idx > 5:
+                break
+            try:
+                async with httpx.AsyncClient(timeout=30, headers=WIKIMEDIA_HEADERS,
+                                             follow_redirects=True) as client:
+                    ir = await client.get(img["url"])
+                print(f"[assets]   {img['url'][-50:]} → {ir.status_code}", flush=True)
+                if ir.status_code == 200 and len(ir.content) > 5000:
+                    # 尺寸/比例检查：避免保存极窄/极矮的图（如图表、横幅）
+                    try:
+                        import io as _io
+                        from PIL import Image as _PILImg
+                        _dim = _PILImg.open(_io.BytesIO(ir.content)).size
+                        _w, _h = _dim
+                        _ratio = max(_w, _h) / max(min(_w, _h), 1)
+                        if _w < 300 or _h < 300 or _ratio > 3.5:
+                            print(f"[assets]   ✗ 跳过不适合视频的图 {_w}x{_h} ratio={_ratio:.1f}", flush=True)
+                            continue
+                    except Exception:
+                        pass
+                    safe_name = re.sub(r'[^\w\u4e00-\u9fff]', '_', q)[:30]
+                    local_name = f"{img_idx:02d}_{safe_name}.jpg"
+                    (asset_dir / local_name).write_bytes(ir.content)
+                    caption = img.get("title", "").replace("File:", "").split(".")[0] or q
+                    assets.append({
+                        "type": img_provider, "url": img["url"],
+                        "local": f"data/stories/{story_id}/assets/{local_name}",
+                        "caption": caption,
+                        "keyword": q,
+                    })
+                    img_idx += 1
+                    print(f"[assets]   ✓ 保存 {local_name} 说明={caption}", flush=True)
+                else:
+                    print(f"[assets]   ✗ status={ir.status_code} size={len(ir.content)}", flush=True)
+            except Exception as e:
+                print(f"[assets] 下载失败: {e}", flush=True)
+            await asyncio.sleep(1)
+
+    c = get_db()
+    c.execute("UPDATE stories SET assets=? WHERE id=?",
+              (json.dumps(assets, ensure_ascii=False), story_id))
+    c.commit(); c.close()
+    print(f"[assets] story {story_id}: {len(assets)} assets fetched", flush=True)
+
+
+async def _run_cover(story_id: int):
+    """生成封面（模块级，供 pipeline 调用）。"""
+    row = db_get_story(story_id)
+    if not row:
+        print(f"[cover] story {story_id} not found", flush=True)
+        return
+    title  = row["book_title"] or ""
+    author = row["book_author"] or ""
+    try:
+        loop = asyncio.get_event_loop()
+        import functools
+        img_bytes = await loop.run_in_executor(
+            None, functools.partial(make_cover_image, title, author)
+        )
+        cover_dir = STORIES_DIR / str(story_id)
+        cover_dir.mkdir(parents=True, exist_ok=True)
+        safe_title = re.sub(r'[^\w\u4e00-\u9fff]', '_', title)[:30]
+        cover_path = cover_dir / f"{safe_title}_cover.jpg"
+        cover_path.write_bytes(img_bytes)
+        c = get_db()
+        c.execute("UPDATE stories SET cover_path=? WHERE id=?", (str(cover_path), story_id))
+        c.commit(); c.close()
+        print(f"[cover] story {story_id}: 封面已保存 ({len(img_bytes)//1024}kB) → {cover_path}", flush=True)
+    except Exception as e:
+        print(f"[cover] 生成失败: {e}", flush=True)
+
+
+async def _run_tts(story_id: int):
+    """生成配音（模块级，供 pipeline 调用）。"""
+    row = db_get_story(story_id)
+    if not row:
+        print(f"[tts] story {story_id} not found", flush=True)
+        return
+    script = row["script"] or ""
+    if not script:
+        print(f"[tts] story {story_id}: 脚本为空，跳过", flush=True)
+        return
+
+    c = get_db(); c.execute("UPDATE stories SET audio_path=NULL WHERE id=?", (story_id,)); c.commit(); c.close()
+    (STORIES_DIR / str(story_id) / "audio.mp3").unlink(missing_ok=True)
+
+    app_id = cfg("VOLC_APPID")
+    token = cfg("VOLC_TOKEN")
+    resource_id = cfg("VOLC_RESOURCE_ID", "volc.megatts.voiceclone")
+    voice_type = cfg("VOLC_VOICE_TYPE")
+    print(f"[tts] 使用音色: {voice_type!r}  resource_id={resource_id}", flush=True)
+    if not all([app_id, token, voice_type]):
+        c = get_db()
+        c.execute("UPDATE stories SET status='producing' WHERE id=?", (story_id,))
+        c.commit(); c.close()
+        print(f"[tts] Volcengine env vars not set, skipping TTS for story {story_id}", flush=True)
+        return
+
+    clean_script = re.sub(r"【[^】]*】", "", script).strip()
+    m_split = re.search(r'今天[要]?讲的是', clean_script)
+    if m_split:
+        part1 = clean_script[:m_split.end()].strip()
+        part2 = clean_script[m_split.end():].strip()
+    else:
+        first_end = re.search(r'[。！？]', clean_script)
+        if first_end:
+            part1 = clean_script[:first_end.end()].strip()
+            part2 = clean_script[first_end.end():].strip()
+        else:
+            part1 = clean_script
+            part2 = ""
+
+    tts_cfg = load_tts_settings()
+    print(f"[tts] 设置: 语速={tts_cfg['speed_ratio']} 音调={tts_cfg['pitch_ratio']} 音量={tts_cfg['volume_ratio']} 停顿={tts_cfg['silence_s']}s", flush=True)
+
+    async def tts_call(text: str) -> bytes:
+        payload = {
+            "app": {"appid": app_id, "token": token, "cluster": "volcano_tts"},
+            "user": {"uid": "bookstory"},
+            "audio": {
+                "voice_type": voice_type,
+                "encoding": "mp3",
+                "speed_ratio": tts_cfg["speed_ratio"],
+                "volume_ratio": tts_cfg["volume_ratio"],
+                "pitch_ratio":  tts_cfg["pitch_ratio"],
+            },
+            "request": {
+                "reqid": str(uuid.uuid4()),
+                "text": text,
+                "text_type": "plain",
+                "operation": "query",
+            },
+        }
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(
+                "https://openspeech.bytedance.com/api/v1/tts",
+                headers={"Authorization": f"Bearer;{token}", "Resource-Id": resource_id},
+                json=payload,
+            )
+        if r.status_code != 200:
+            raise Exception(f"TTS API错误: {r.status_code} {r.text[:200]}")
+        data = r.json()
+        if data.get("code") != 3000:
+            raise Exception(f"TTS失败: {data.get('message', '未知错误')}")
+        return base64.b64decode(data["data"])
+
+    try:
+        story_dir = STORIES_DIR / str(story_id)
+        story_dir.mkdir(exist_ok=True)
+
+        part_title = ""
+        part_story = part2
+        if part2:
+            m_title = re.search(r'》', part2)
+            if m_title:
+                part_title = part2[:m_title.end()].strip()
+                part_story  = part2[m_title.end():].strip()
+            else:
+                m_sent = re.search(r'[。！？]', part2)
+                if m_sent:
+                    part_title = part2[:m_sent.end()].strip()
+                    part_story  = part2[m_sent.end():].strip()
+
+        bytes1 = await tts_call(part1)
+        (story_dir / "tts_part1.mp3").write_bytes(bytes1)
+
+        if part2:
+            concat_list = story_dir / "tts_concat.txt"
+            silence1 = story_dir / "tts_silence1.mp3"
+            silence2 = story_dir / "tts_silence2.mp3"
+
+            async def make_silence(path, duration: float):
+                await run_subprocess(
+                    ["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
+                     "-t", str(duration), "-q:a", "9", "-acodec", "libmp3lame", str(path)],
+                    capture_output=True, timeout=15
+                )
+
+            await make_silence(silence1, 0.3)
+            audio_path = story_dir / "audio.mp3"
+
+            if part_title and part_story:
+                await make_silence(silence2, 0.3)
+                bytes_title = await tts_call(part_title)
+                bytes_story = await tts_call(part_story)
+                (story_dir / "tts_title.mp3").write_bytes(bytes_title)
+                (story_dir / "tts_story.mp3").write_bytes(bytes_story)
+                concat_list.write_text(
+                    f"file '{(story_dir / 'tts_part1.mp3').resolve()}'\n"
+                    f"file '{silence1.resolve()}'\n"
+                    f"file '{(story_dir / 'tts_title.mp3').resolve()}'\n"
+                    f"file '{silence2.resolve()}'\n"
+                    f"file '{(story_dir / 'tts_story.mp3').resolve()}'\n",
+                    encoding="utf-8"
+                )
+                await run_subprocess(
+                    ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                     "-i", str(concat_list), "-c", "copy", str(audio_path)],
+                    capture_output=True, timeout=60
+                )
+                concat_list.unlink(missing_ok=True)
+                silence1.unlink(missing_ok=True)
+                silence2.unlink(missing_ok=True)
+                (story_dir / "tts_part1.mp3").unlink(missing_ok=True)
+                (story_dir / "tts_title.mp3").unlink(missing_ok=True)
+                (story_dir / "tts_story.mp3").unlink(missing_ok=True)
+            else:
+                bytes2 = await tts_call(part2)
+                (story_dir / "tts_part2.mp3").write_bytes(bytes2)
+                concat_list.write_text(
+                    f"file '{(story_dir / 'tts_part1.mp3').resolve()}'\n"
+                    f"file '{silence1.resolve()}'\n"
+                    f"file '{(story_dir / 'tts_part2.mp3').resolve()}'\n",
+                    encoding="utf-8"
+                )
+                await run_subprocess(
+                    ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                     "-i", str(concat_list), "-c", "copy", str(audio_path)],
+                    capture_output=True, timeout=60
+                )
+                concat_list.unlink(missing_ok=True)
+                silence1.unlink(missing_ok=True)
+                (story_dir / "tts_part1.mp3").unlink(missing_ok=True)
+                (story_dir / "tts_part2.mp3").unlink(missing_ok=True)
+        else:
+            audio_path = story_dir / "audio.mp3"
+            (story_dir / "tts_part1.mp3").rename(audio_path)
+
+        c = get_db()
+        c.execute(
+            "UPDATE stories SET audio_path=?, status='producing', updated_at=? WHERE id=?",
+            (str(audio_path), int(datetime.now().timestamp()), story_id)
+        )
+        c.commit(); c.close()
+        print(f"[tts] story {story_id}: audio saved ({part1[:20]}… | 书名:{part_title[:10] if part_title else '-'} | 正文:{len(part_story)}字)", flush=True)
+    except Exception as e:
+        print(f"[tts] story {story_id} failed: {e}", flush=True)
+
+
+async def _run_render(story_id: int):
+    """合成视频（模块级，供 pipeline 调用）。"""
+    row = db_get_story(story_id)
+    if not row:
+        print(f"[render] story {story_id} not found", flush=True)
+        return
+    story_dir = STORIES_DIR / str(story_id)
+    story_dir.mkdir(exist_ok=True)
+    title = row["book_title"]
+    safe_title = re.sub(r'[^\w\u4e00-\u9fff]', '_', title)[:30]
+    output_path = story_dir / f"{safe_title}_video.mp4"
+    author = row["book_author"] or ""
+    script = row["script"] or ""
+
+    def set_error(msg: str):
+        c = get_db()
+        c.execute("UPDATE stories SET error_msg=?, status='script_approved' WHERE id=?",
+                  (msg, story_id))
+        c.commit(); c.close()
+
+    try:
+        if not (REMOTION_DIR / "node_modules").exists():
+            set_error("请先点击「初始化视频项目」")
+            print(f"[render] Remotion 未初始化，请先调用 /api/setup-remotion", flush=True)
+            return
+
+        (REMOTION_DIR / "src" / "Composition.tsx").write_text(REMOTION_COMPOSITION_TSX, encoding="utf-8")
+
+        import shutil as _shutil
+        intro_src = Path("intro_src/FilmStrip.tsx")
+        if intro_src.exists():
+            intro_code = intro_src.read_text(encoding="utf-8")
+            intro_code = intro_code.replace(
+                "const { width, height } = useVideoConfig();",
+                "const { width, height, durationInFrames } = useVideoConfig();"
+            )
+            intro_code = intro_code.replace(
+                "[0, FILM_DURATION]",
+                "[0, durationInFrames]"
+            )
+            (REMOTION_DIR / "src" / "FilmStrip.tsx").write_text(intro_code, encoding="utf-8")
+            pub_dir = REMOTION_DIR / "public"
+            intro_pub = Path("intro_src/public")
+            if intro_pub.exists():
+                for img_file in intro_pub.iterdir():
+                    _shutil.copy2(str(img_file), str(pub_dir / img_file.name))
+            print(f"[render] 片头组件 FilmStrip.tsx 已拷贝，图片资源已同步", flush=True)
+        else:
+            print(f"[render] 警告：找不到 intro_src/FilmStrip.tsx，片头将跳过", flush=True)
+
+        if not all([cfg("VOLC_APPID"), cfg("VOLC_TOKEN"), cfg("VOLC_VOICE_TYPE")]):
+            set_error("请先配置 VOLC_APPID / VOLC_TOKEN / VOLC_VOICE_TYPE")
+            return
+
+        asset_dir = story_dir / "assets"
+        all_img_files = sorted(asset_dir.glob("*.jpg")) if asset_dir.exists() else []
+        img_files = []
+        for _f in all_img_files:
+            try:
+                import io
+                from PIL import Image as PILImage
+                _img = PILImage.open(_f)
+                _w, _h = _img.size
+                if _w >= 300 and _h >= 300:
+                    img_files.append(_f)
+                else:
+                    print(f"[render] 跳过低分辨率图片 {_f.name} ({_w}x{_h})", flush=True)
+            except Exception:
+                img_files.append(_f)
+        if not img_files:
+            set_error("请先抓取素材再生成视频")
+            return
+
+        raw_paragraphs = [p.strip() for p in re.split(r'\n\s*\n|(?=【)', script) if p.strip()]
+        if len(raw_paragraphs) <= 1:
+            sentences = re.split(r'(?<=[。！？])', script.strip())
+            sentences = [s.strip() for s in sentences if s.strip()]
+            groups, buf = [], ""
+            for s in sentences:
+                if len(buf) + len(s) <= 60:
+                    buf += s
+                else:
+                    if buf:
+                        groups.append(buf)
+                    buf = s
+            if buf:
+                groups.append(buf)
+            raw_paragraphs = groups if groups else [script]
+        paragraphs = [re.sub(r'^【[^】]*】\s*', '', p).strip() for p in raw_paragraphs]
+        paragraphs = [p for p in paragraphs if p]
+        print(f"[render] story {story_id}: {len(paragraphs)} 个场景，{len(img_files)} 张图", flush=True)
+
+        audio_src = story_dir / "audio.mp3"
+        if not audio_src.exists():
+            set_error("请先生成配音再合成视频")
+            return
+
+        c = get_db(); c.execute("UPDATE stories SET video_path=NULL WHERE id=?", (story_id,)); c.commit(); c.close()
+        for _old in list(story_dir.glob("*_video.mp4")) + [story_dir / "video.mp4"]:
+            _old.unlink(missing_ok=True)
+
+        pub_images = REMOTION_DIR / "public" / "images"
+        pub_images.mkdir(parents=True, exist_ok=True)
+        for f in pub_images.glob("scene-*"):
+            f.unlink(missing_ok=True)
+
+        import shutil
+        pub_audio = REMOTION_DIR / "public" / "audio.mp3"
+        shutil.copy2(str(audio_src), str(pub_audio))
+
+        probe = await run_subprocess(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(pub_audio)],
+            capture_output=True, text=True,
+        )
+        total_duration_s = 30.0
+        try:
+            total_duration_s = float(json.loads(probe.stdout)["format"]["duration"])
+        except Exception:
+            pass
+        FPS = 30
+
+        n_scenes = len(img_files)
+        audio_frames = math.ceil(total_duration_s * FPS) + 20
+
+        m_intro = re.search(r'今天讲的是', script)
+        intro_end_pos = m_intro.end() if m_intro else 0
+        if not intro_end_pos and title:
+            intro_end_pos = script.find(title[:4]) if len(title) >= 4 else script.find(title)
+            intro_end_pos = max(0, intro_end_pos)
+        total_script_chars = len(script)
+        if total_script_chars > 0 and intro_end_pos > 0:
+            intro_frames = int((intro_end_pos / total_script_chars) * audio_frames)
+        else:
+            intro_frames = 90
+        intro_frames = max(60, min(intro_frames, 150))
+        intro_frames += 12
+        if not (REMOTION_DIR / "src" / "FilmStrip.tsx").exists():
+            intro_frames = 0
+        print(f"[render] 片头帧数={intro_frames}（{intro_frames/FPS:.1f}s），内容图片从此后开始", flush=True)
+
+        content_frames = audio_frames - intro_frames
+        base = content_frames // n_scenes
+        scene_frames = [base] * n_scenes
+        for i in range(content_frames - sum(scene_frames)):
+            scene_frames[i] += 1
+        total_frames = intro_frames + sum(scene_frames)
+
+        scene_images = []
+        for i, img in enumerate(img_files):
+            dest = pub_images / f"scene-{i+1:02d}{img.suffix}"
+            shutil.copy2(str(img), str(dest))
+            scene_images.append(f"images/scene-{i+1:02d}{img.suffix}")
+        print(f"[render] 总时长={total_duration_s:.1f}s 总帧数={total_frames} 图片数={n_scenes}", flush=True)
+
+        cover_trans_src = Path("intro_src/CoverTransition.tsx")
+        if cover_trans_src.exists():
+            _shutil.copy2(str(cover_trans_src), str(REMOTION_DIR / "src" / "CoverTransition.tsx"))
+
+        story_cover_file = ""
+        if img_files:
+            _shutil.copy2(str(img_files[0]), str(REMOTION_DIR / "public" / "story_cover.jpg"))
+            story_cover_file = "story_cover.jpg"
+            print(f"[render] 书封已复制: {img_files[0].name}", flush=True)
+
+        def to_subtitle_chunks(text: str, max_len: int = 18) -> list:
+            sentences = [s.strip() for s in re.split(r'(?<=[。！？])', text.strip()) if s.strip()]
+            chunks = []
+            for sent in sentences:
+                while len(sent) > max_len:
+                    split_at = None
+                    for j in range(min(max_len, len(sent) - 1), 0, -1):
+                        if sent[j] in '，、；：':
+                            split_at = j + 1
+                            break
+                    if split_at is None:
+                        split_at = max_len
+                    chunks.append(sent[:split_at])
+                    sent = sent[split_at:]
+                if sent:
+                    chunks.append(sent)
+            return [c.rstrip('。！？，、；：…—') for c in chunks]
+
+        total_ms = int(total_duration_s * 1000)
+        sub_chunks = to_subtitle_chunks(script.strip())
+        total_chunk_chars = sum(len(c) for c in sub_chunks)
+        subtitles = []
+        cur_ms = 0
+        for chunk in sub_chunks:
+            dur_ms = int(total_ms * len(chunk) / total_chunk_chars) if total_chunk_chars else 2000
+            subtitles.append({"text": chunk, "startMs": cur_ms, "endMs": cur_ms + dur_ms})
+            cur_ms += dur_ms
+        title_card_start_ms = int(intro_frames / FPS * 1000)
+        title_card_end_ms   = title_card_start_ms + 2500
+
+        scene_entries = []
+        for i in range(n_scenes):
+            scene_entries.append(
+                f'  {{ id: "scene-{i+1:02d}", image: "{scene_images[i]}", '
+                f'narration: "", durationInFrames: {scene_frames[i]} }}'
+            )
+        subtitle_entries = ",\n".join(
+            f'  {{ text: {json.dumps(s["text"], ensure_ascii=False)}, startMs: {s["startMs"]}, endMs: {s["endMs"]} }}'
+            for s in subtitles
+        )
+        content_ts = (
+            'export type Scene = { id: string; image: string; narration: string; durationInFrames: number };\n'
+            'export type Sub = { text: string; startMs: number; endMs: number };\n\n'
+            'export const SCENES: Scene[] = [\n' + ',\n'.join(scene_entries) + '\n];\n\n'
+            'export const SUBTITLES: Sub[] = [\n' + subtitle_entries + '\n];\n\n'
+            f'export const TOTAL_FRAMES = {total_frames};\n'
+            'export const AUDIO_FILE = "audio.mp3";\n'
+            f'export const BOOK_TITLE = {json.dumps(title, ensure_ascii=False)};\n'
+            f'export const TITLE_CARD_MS = {{ startMs: {title_card_start_ms}, endMs: {title_card_end_ms} }};\n'
+            f'export const INTRO_FRAMES = {intro_frames};\n'
+            f'export const STORY_COVER = {json.dumps(story_cover_file)};\n'
+        )
+        (REMOTION_DIR / "src" / "content.ts").write_text(content_ts, encoding="utf-8")
+        print(f"[render] content.ts 已生成，字幕{len(subtitles)}句", flush=True)
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        render_cmd = [
+            "npx", "remotion", "render",
+            "src/index.ts",
+            "BookStory",
+            str(output_path.resolve()),
+        ]
+        print(f"[render] 开始 Remotion 渲染…", flush=True)
+        result = await run_subprocess(
+            render_cmd, cwd=str(REMOTION_DIR),
+            capture_output=True, text=True, timeout=600
+        )
+        if result.returncode == 0 and output_path.exists():
+            web_path = story_dir / "video_web.mp4"
+            fs = await run_subprocess(
+                ["ffmpeg", "-y", "-i", str(output_path),
+                 "-c:v", "libx264", "-crf", "23", "-preset", "fast",
+                 "-pix_fmt", "yuv420p",
+                 "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
+                 "-c:a", "aac", "-b:a", "128k",
+                 "-movflags", "+faststart",
+                 str(web_path)],
+                capture_output=True, timeout=180
+            )
+            if fs.returncode == 0 and web_path.exists():
+                web_path.replace(output_path)
+                print(f"[render] ✓ 视频 web 优化完成", flush=True)
+
+            c = get_db()
+            c.execute("UPDATE stories SET video_path=?, status='done' WHERE id=?",
+                      (str(output_path), story_id))
+            c.commit(); c.close()
+            print(f"[render] ✓ story {story_id}: 视频已保存 {output_path}", flush=True)
+        else:
+            err = (result.stderr or result.stdout or "未知错误")
+            print(f"[render] Remotion 失败 (stdout):\n{result.stdout[-1000:]}", flush=True)
+            print(f"[render] Remotion 失败 (stderr):\n{result.stderr[-1000:]}", flush=True)
+            set_error(f"渲染失败: {err[-100:]}")
+
+    except Exception as e:
+        import traceback
+        print(f"[render] 未捕获异常: {e}\n{traceback.format_exc()}", flush=True)
+        try:
+            set_error(f"渲染异常: {str(e)[:100]}")
+        except Exception:
+            pass
+
+
+async def _run_pipeline(story_id: int):
+    """一键全流程：脚本 → 并行(素材+封面+配音) → 合成视频"""
+    print(f"[pipeline] ▶ story={story_id}", flush=True)
+    row = db_get_story(story_id)
+    if not row:
+        print(f"[pipeline] story {story_id} not found", flush=True)
+        return
+
+    # Step 1: 生成脚本（如果还没有审核过的脚本）
+    if row["status"] not in ("script_approved", "producing", "done"):
+        await _run_generate(story_id)
+        # pipeline 模式下自动审核，跳过人工审核
+        c = get_db()
+        c.execute("UPDATE stories SET status='script_approved' WHERE id=? AND status='script_draft'", (story_id,))
+        c.commit(); c.close()
+
+    # Step 2: 并行抓素材 + 封面 + 配音
+    results = await asyncio.gather(
+        _run_fetch(story_id),
+        _run_cover(story_id),
+        _run_tts(story_id),
+        return_exceptions=True,
+    )
+    for i, r in enumerate(results):
+        if isinstance(r, Exception):
+            step_name = ["fetch", "cover", "tts"][i]
+            print(f"[pipeline] ⚠ {step_name} 步骤异常（已忽略）: {r}", flush=True)
+
+    # Step 3: 合成视频
+    await _run_render(story_id)
+    print(f"[pipeline] ✓ story={story_id} 全流程完成", flush=True)
+
+
+@app.post("/api/stories/{story_id}/run-pipeline")
+async def api_run_pipeline(story_id: int, background_tasks: BackgroundTasks):
+    row = db_get_story(story_id)
+    if not row:
+        raise HTTPException(404, "Story not found")
+    if row["status"] not in ("research_done", "script_draft", "script_approved"):
+        raise HTTPException(400, f"当前状态 {row['status']} 不支持一键生成")
+    background_tasks.add_task(_run_pipeline, story_id)
+    return {"ok": True, "message": "一键生成任务已启动"}
+
+
+async def _run_book_pipeline(book_id: int):
+    """从书籍维度一键全流程：自动创建故事 → 研究+脚本 → 自动审核 → 并行(素材+封面+配音) → 合成视频"""
+    conn = get_db()
+    book = conn.execute("SELECT * FROM books WHERE id=?", (book_id,)).fetchone()
+    latest_story = conn.execute(
+        "SELECT id, status FROM stories WHERE book_id=? ORDER BY created_at DESC LIMIT 1",
+        (book_id,)
+    ).fetchone()
+    conn.close()
+    if not book:
+        print(f"[book_pipeline] book {book_id} not found", flush=True)
+        return
+
+    # 如果已有可用状态的故事，直接走故事级 pipeline
+    if latest_story and latest_story["status"] in ("research_done", "script_draft", "script_approved"):
+        await _run_pipeline(latest_story["id"])
+        return
+
+    # 需要从头创建故事
+    if not latest_story or latest_story["status"] == "failed":
+        conn = get_db()
+        used = {r["angle"] for r in conn.execute(
+            "SELECT angle FROM stories WHERE book_id=?", (book_id,)
+        ).fetchall()}
+        conn.close()
+        available = [a for a in STORY_ANGLES if a not in used] or list(STORY_ANGLES)
+        angle = available[0]
+        conn = get_db()
+        cur = conn.execute(
+            "INSERT INTO stories(book_id, angle, status) VALUES(?,?,?)",
+            (book_id, angle, "pending_research")
+        )
+        story_id = cur.lastrowid
+        conn.commit(); conn.close()
+        story_dir = STORIES_DIR / str(story_id)
+        story_dir.mkdir(exist_ok=True)
+        (story_dir / "assets").mkdir(exist_ok=True)
+        print(f"[book_pipeline] ▶ book={book_id} 创建故事 story={story_id} 角度={angle}", flush=True)
+    else:
+        story_id = latest_story["id"]
+        print(f"[book_pipeline] ▶ book={book_id} 使用现有故事 story={story_id}", flush=True)
+
+    # 运行发现流程（研究 + 脚本）
+    await discover_story_bg(book_id, story_id)
+
+    # 检查是否成功生成脚本
+    row = db_get_story(story_id)
+    if not row or row["status"] == "failed":
+        print(f"[book_pipeline] story {story_id} 研究/脚本失败，中止", flush=True)
+        return
+
+    # 自动审核
+    conn = get_db()
+    conn.execute(
+        "UPDATE stories SET status='script_approved' WHERE id=? AND status='script_draft'",
+        (story_id,)
+    )
+    conn.commit(); conn.close()
+
+    # 并行：素材 + 封面 + 配音
+    results = await asyncio.gather(
+        _run_fetch(story_id),
+        _run_cover(story_id),
+        _run_tts(story_id),
+        return_exceptions=True,
+    )
+    for i, r in enumerate(results):
+        if isinstance(r, Exception):
+            print(f"[book_pipeline] ⚠ {['fetch','cover','tts'][i]} 异常: {r}", flush=True)
+
+    # 合成视频
+    await _run_render(story_id)
+    print(f"[book_pipeline] ✓ book={book_id} story={story_id} 全流程完成", flush=True)
+
+
+@app.post("/api/books/{book_id}/run-pipeline")
+async def api_book_run_pipeline(book_id: int, background_tasks: BackgroundTasks):
+    conn = get_db()
+    book = conn.execute("SELECT id FROM books WHERE id=?", (book_id,)).fetchone()
+    latest_story = conn.execute(
+        "SELECT id, status FROM stories WHERE book_id=? ORDER BY created_at DESC LIMIT 1",
+        (book_id,)
+    ).fetchone()
+    conn.close()
+    if not book:
+        raise HTTPException(404, "Book not found")
+    # 正在进行中时不允许重复触发
+    if latest_story and latest_story["status"] in ("researching", "scripting", "producing"):
+        raise HTTPException(400, f"当前状态 {latest_story['status']} 不支持一键生成，请等待完成")
+    background_tasks.add_task(_run_book_pipeline, book_id)
+    return {"ok": True, "message": "一键生成任务已启动"}
+
 
 # ── 豆瓣 Top250 导入 ──────────────────────────────────────────────────────────
 @app.post("/api/books/import-douban-top250")
@@ -2780,25 +3862,27 @@ def api_import_awards():
 @app.post("/api/books/import-trending")
 async def api_import_trending(background_tasks: BackgroundTasks):
     async def do_import():
-        queries = ["本月热门小说 2025", "近期畅销书 豆瓣", "trending novels 2025 China"]
+        queries = ["2025年畅销书单 豆瓣", "近期热门文学小说推荐", "当下流行书籍排行榜"]
         raw_titles = []
         for q in queries:
             results = await brave_search(q)
-            for item in results[:3]:
-                raw_titles.append(item.get("title", "") + " " + item.get("description", ""))
+            for item in results[:4]:
+                # 只保留标题和摘要，截断过长内容，降低 Kimi 风控触发概率
+                snippet = (item.get("title", "") + " " + item.get("description", ""))[:200]
+                raw_titles.append(snippet)
 
         if not raw_titles:
             print("[trending] no search results", flush=True)
             return
 
-        combined = "\n".join(raw_titles[:15])
-        prompt = f"""从以下搜索结果中，提取出10-20本真实存在的热门书籍名称和作者。
-只要书名和作者，去掉无关内容。
+        combined = "\n".join(raw_titles[:12])
+        prompt = f"""以下是书籍相关搜索摘要，请从中识别并列出10-20本书的书名和作者。
+仅输出书名和作者，忽略无关内容。
 
-搜索结果：
+摘要：
 {combined}
 
-严格返回JSON：{{"books": [{{"title": "书名", "author": "作者"}}]}}"""
+返回JSON：{{"books": [{{"title": "书名", "author": "作者"}}]}}"""
 
         try:
             text = await kimi_chat(prompt, temperature=1)
